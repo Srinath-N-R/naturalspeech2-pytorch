@@ -7,15 +7,15 @@ if version.parse(torch.__version__) >= version.parse('2.0.0'):
 
 from naturalspeech2_pytorch.naturalspeech2_pytorch import (
     NaturalSpeech2,
-    Transformer,
     Wavenet,
     Model,
-    Trainer,
+    CustomDataset,
     PhonemeEncoder,
-    DurationPitchPredictor,
+    DurationPitchPred,
     SpeechPromptEncoder,
     Tokenizer,
-    ESpeak
+    ESpeak,
+    custom_collate_fn
 )
 
 from audiolm_pytorch import (

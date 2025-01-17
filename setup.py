@@ -21,6 +21,7 @@ setup(
   ],
   install_requires=[
     'accelerate',
+    'transformers',
     'audiolm-pytorch>=0.30.2',
     'beartype',
     'einops>=0.6.1',
@@ -33,7 +34,13 @@ setup(
     'pydantic<2.0',
     'torch>=1.6',
     'tqdm',
-    'vector-quantize-pytorch>=1.4.1'
+    'vector-quantize-pytorch>=1.4.1',
+    'phonemizer',
+    'librosa',
+    'datasets',
+    'espeakng',
+    'speechbrain',
+    'flamingo-pytorch'
   ],
   classifiers=[
     'Development Status :: 4 - Beta',
