@@ -1,47 +1,81 @@
 import math
-import copy
-from multiprocessing import cpu_count
-from pathlib import Path
-from random import random
-from functools import partial
-from collections import namedtuple
+import json
 
+from math import expm1
+from pathlib import Path
+from functools import partial
+
+import logging
 import numpy as np
 
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum, Tensor
-from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
+from torch import nn, einsum
+from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
 
 import torchaudio
-import torchaudio.transforms as T
+from torch.cuda.amp import autocast
 
+from naturalspeech2_pytorch.attend import Attend
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
 
 from audiolm_pytorch import SoundStream, EncodecWrapper
-from audiolm_pytorch.data import SoundDataset, get_dataloader
 
 from beartype import beartype
-from beartype.typing import Tuple, Union, Optional, List
+from beartype.typing import Tuple, Union, Optional
 from beartype.door import is_bearable
 
-from naturalspeech2_pytorch.attend import Attend
-from naturalspeech2_pytorch.aligner import Aligner, ForwardSumLoss, BinLoss
+
 from naturalspeech2_pytorch.utils.tokenizer import Tokenizer, ESpeak
-from naturalspeech2_pytorch.utils.utils import average_over_durations, create_mask
 from naturalspeech2_pytorch.version import __version__
 
-from accelerate import Accelerator
-from ema_pytorch import EMA
+from naturalspeech2_pytorch.wavenet import Wavenet
 
+from speechbrain.lobes.models.FastSpeech2 import EncoderPreNet
+
+from speechbrain.lobes.models.transformer.Transformer import (
+    PositionalEncoding,
+    TransformerEncoder,
+    get_key_padding_mask,
+) 
+from speechbrain.nnet import CNN, linear
+from speechbrain.nnet.normalization import LayerNorm
+
+from flamingo_pytorch import PerceiverResampler
+
+from functools import wraps
 from tqdm.auto import tqdm
-import pyworld as pw
+
 
 # constants
 
 mlist = nn.ModuleList
+
+def once(fn):
+    called = False
+    @wraps(fn)
+    def inner(x):
+        nonlocal called
+        if called:
+            return
+        called = True
+        return fn(x)
+    return inner
+
+print_once = once(print)
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,  # Set logging level to INFO
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Direct logs to the console
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 def Sequential(*mods):
     return nn.Sequential(*filter(exists, mods))
@@ -64,6 +98,7 @@ def identity(t, *args, **kwargs):
 
 def has_int_squareroot(num):
     return (math.sqrt(num) ** 2) == num
+
 
 # tensor helpers
 
@@ -103,63 +138,37 @@ def generate_mask_from_repeats(repeats):
     mask = (seq < cumsum) & (seq >= cumsum_exclusive) & (seq < lengths)
     return mask
 
-# sinusoidal positional embeds
 
-class LearnedSinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        assert divisible_by(dim, 2)
-        half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(half_dim))
+def custom_collate_fn(batch):
+    try:
+        # Ensure consistent dimension for audio and prompt
+        audio = [item['audio'].squeeze(0) for item in batch]
+        prompt = [item['prompt'].squeeze(0) for item in batch]
 
-    def forward(self, x):
-        x = rearrange(x, 'b -> b 1')
-        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
-        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim = -1)
-        fouriered = torch.cat((x, fouriered), dim = -1)
-        return fouriered
+        # text = [item['text'] for item in batch]
+        # tokenizer = Tokenizer()  # Replace with your tokenizer instance
+        # text = tokenizer.texts_to_tensor_ids([item['text'] for item in batch])
+        phoneme = [item['phoneme'] for item in batch]
+        speaker_embeddings = torch.stack([item['speaker_embeddings'] for item in batch])
+        context_embeddings = torch.stack([item['context_embeddings'] for item in batch])
+        
+        # Pad audio and prompt to the same length
+        audio = pad_sequence(audio, batch_first=True)
+        prompt = pad_sequence(prompt, batch_first=True)
+        segment = [item['segment'] for item in batch]
 
-# compute pitch
+        return {
+            'audio': audio,
+            'segment': segment,
+            'prompt': prompt,
+            'phoneme': phoneme,
+            'speaker_embeddings': speaker_embeddings,
+            'context_embeddings': context_embeddings,
+        }
+    except Exception as e:
+        logger.error(f"Error in custom_collate_fn: {e}")
+        raise
 
-def compute_pitch_pytorch(wav, sample_rate):
-    #https://pytorch.org/audio/main/generated/torchaudio.functional.compute_kaldi_pitch.html#torchaudio.functional.compute_kaldi_pitch
-    pitch_feature = torchaudio.functional.compute_kaldi_pitch(wav, sample_rate)
-    pitch, nfcc = pitch_feature.unbind(dim = -1)
-    return pitch
-
-#as mentioned in paper using pyworld
-
-def compute_pitch_pyworld(wav, sample_rate, hop_length, pitch_fmax=640.0):
-    is_tensor_input = torch.is_tensor(wav)
-
-    if is_tensor_input:
-        device = wav.device
-        wav = wav.contiguous().cpu().numpy()
-
-    if divisible_by(len(wav), hop_length):
-        wav = np.pad(wav, (0, hop_length // 2), mode="reflect")
-
-    wav = wav.astype(np.double)
-
-    outs = []
-
-    for sample in wav:
-        f0, t = pw.dio(
-            sample,
-            fs = sample_rate,
-            f0_ceil = pitch_fmax,
-            frame_period = 1000 * hop_length / sample_rate,
-        )
-
-        f0 = pw.stonemask(sample, f0, t, sample_rate)
-        outs.append(f0)
-
-    outs = np.stack(outs)
-
-    if is_tensor_input:
-        outs = torch.from_numpy(outs).to(device)
-
-    return outs
 
 def f0_to_coarse(f0, f0_bin = 256, f0_max = 1100.0, f0_min = 50.0):
     f0_mel_max = 1127 * torch.log(1 + torch.tensor(f0_max) / 700)
@@ -176,118 +185,233 @@ def f0_to_coarse(f0, f0_bin = 256, f0_max = 1100.0, f0_min = 50.0):
 
 # peripheral models
 
-# audio to mel
-
-class AudioToMel(nn.Module):
-    def __init__(
-        self,
-        *,
-        n_mels = 100,
-        sampling_rate = 24000,
-        f_max = 8000,
-        n_fft = 1024,
-        win_length = 640,
-        hop_length = 160,
-        log = True
-    ):
-        super().__init__()
-        self.log = log
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.f_max = f_max
-        self.win_length = win_length
-        self.hop_length = hop_length
-        self.sampling_rate = sampling_rate
-
-    def forward(self, audio):
-        stft_transform = T.Spectrogram(
-            n_fft = self.n_fft,
-            win_length = self.win_length,
-            hop_length = self.hop_length,
-            window_fn = torch.hann_window
-        )
-
-        spectrogram = stft_transform(audio)
-
-        mel_transform = T.MelScale(
-            n_mels = self.n_mels,
-            sample_rate = self.sampling_rate,
-            n_stft = self.n_fft // 2 + 1,
-            f_max = self.f_max
-        )
-
-        mel = mel_transform(spectrogram)
-
-        if self.log:
-            mel = T.AmplitudeToDB()(mel)
-
-        return mel
-
-# phoneme - pitch - speech prompt - duration predictors
-
 class PhonemeEncoder(nn.Module):
     def __init__(
         self,
         *,
-        tokenizer: Optional[Tokenizer] = None,
-        num_tokens = None,
-        dim = 512,
-        dim_hidden = 512,
-        kernel_size = 9,
-        depth = 6,
-        dim_head = 64,
-        heads = 8,
-        conv_dropout = 0.2,
-        attn_dropout = 0.,
-        use_flash = False
+        tokenizer,
+        padding_value=0,
+        enc_d_model=512,
+        enc_num_layers=6,
+        enc_num_head=2,
+        enc_ffn_dim=1536,
+        enc_k_dim=512,
+        enc_v_dim=512,
+        enc_dropout=0.1,
+        normalize_before=False,
+        ffn_type='1dcnn',
+        ffn_cnn_kernel_size_list=[9, 1],
     ):
         super().__init__()
 
+        self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         self.tokenizer = tokenizer
-        num_tokens = default(num_tokens, tokenizer.vocab_size if exists(tokenizer) else None)
+        self.padding_idx = padding_value
+        n_char = len(tokenizer.vocab)
+        self.enc_num_head = enc_num_head
 
-        self.token_emb = nn.Embedding(num_tokens + 1, dim) if exists(num_tokens) else nn.Identity()
-        self.pad_id = num_tokens
-
-        same_padding = (kernel_size - 1) // 2
-
-        self.conv = nn.Sequential(
-            Rearrange('b n c -> b c n'),
-            CausalConv1d(dim, dim_hidden, kernel_size),
-            nn.SiLU(),
-            nn.Dropout(conv_dropout),
-            Rearrange('b c n -> b n c'),
+        self.encPreNet = EncoderPreNet(
+            n_char, padding_value, out_channels=enc_d_model
+        )
+        self.encoder = TransformerEncoder(
+            num_layers=enc_num_layers,
+            nhead=enc_num_head,
+            d_ffn=enc_ffn_dim,
+            d_model=enc_d_model,
+            kdim=enc_k_dim,
+            vdim=enc_v_dim,
+            dropout=enc_dropout,
+            activation=nn.ReLU,
+            normalize_before=normalize_before,
+            ffn_type=ffn_type,
+            ffn_cnn_kernel_size_list=ffn_cnn_kernel_size_list,
         )
 
-        self.transformer = Transformer(
-            dim = dim_hidden,
-            depth = depth,
-            dim_head = dim_head,
-            heads = heads,
-            dropout = attn_dropout,
-            use_flash = use_flash
+        self.sinusoidal_positional_embed_encoder = PositionalEncoding(
+            enc_d_model
         )
 
-    @beartype
+
     def forward(
         self,
-        x: Union[Tensor, List[str]],
-        mask = None
+        x: str,
     ):
-        if is_bearable(x, List[str]):
-            assert exists(self.tokenizer)
-            x = self.tokenizer.texts_to_tensor_ids(x)
+        x = self.tokenizer.phoneme_to_tensor_ids(x, self.padding_idx)
+        x = x.to(device=self._device)
+        srcmask = get_key_padding_mask(x, pad_idx=self.padding_idx)
+        srcmask_inverted = (~srcmask).unsqueeze(-1)
 
-        is_padding = x < 0
-        x = x.masked_fill(is_padding, self.pad_id)
+        # prenet & encoder
+        x = self.encPreNet(x)
+        pos = self.sinusoidal_positional_embed_encoder(x)
+        x = torch.add(x, pos) * srcmask_inverted
+        attn_mask = (
+            srcmask.unsqueeze(-1)
+            .repeat(self.enc_num_head, 1, x.shape[1])
+            .permute(0, 2, 1)
+            .bool()
+        )
+        x, _ = self.encoder(
+            x, src_mask=attn_mask, src_key_padding_mask=srcmask
+        )
+        x = x * srcmask_inverted
+        return x, srcmask_inverted
 
-        x = self.token_emb(x)
-        x = self.conv(x)
-        x = self.transformer(x, mask = mask)
-        return x
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, scale = True, dim_cond = None):
+        super().__init__()
+        self.cond = exists(dim_cond)
+        self.to_gamma_beta = nn.Linear(dim_cond, dim * 2) if self.cond else None
+
+        self.scale = dim ** 0.5
+        self.gamma = nn.Parameter(torch.ones(dim)) if scale else None
+
+    def forward(self, x, cond = None):
+        gamma = default(self.gamma, 1)
+        out = F.normalize(x, dim = -1) * self.scale * gamma
+
+        if not self.cond:
+            return out
+
+        assert exists(cond)
+        gamma, beta = self.to_gamma_beta(cond).chunk(2, dim = -1)
+        gamma, beta = map(lambda t: rearrange(t, 'b d -> b 1 d'), (gamma, beta))
+        return out * gamma + beta
+
+
+class CausalConv1d(nn.Conv1d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        kernel_size, = self.kernel_size
+        dilation, = self.dilation
+        stride, = self.stride
+
+        assert stride == 1
+        self.causal_padding = dilation * (kernel_size - 1)
+
+    def forward(self, x):
+        causal_padded_x = F.pad(x, (self.causal_padding, 0), value = 0.)
+        return super().forward(causal_padded_x)
+
+
+class GEGLU(nn.Module):
+    def forward(self, x):
+        x, gate = x.chunk(2, dim = -1)
+        return F.gelu(gate) * x
+
+def FeedForward(dim, mult = 4, causal_conv = False):
+    dim_inner = int(dim * mult * 2 / 3)
+
+    conv = None
+    if causal_conv:
+        conv = nn.Sequential(
+            Rearrange('b n d -> b d n'),
+            CausalConv1d(dim_inner, dim_inner, 3),
+            Rearrange('b d n -> b n d'),
+        )
+
+    return Sequential(
+        nn.Linear(dim, dim_inner * 2),
+        GEGLU(),
+        conv,
+        nn.Linear(dim_inner, dim)
+    )
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        dim_context = None,
+        causal = False,
+        dim_head = 64,
+        heads = 8,
+        dropout = 0.,
+        use_flash = False,
+        cross_attn_include_queries = False
+    ):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        self.cross_attn_include_queries = cross_attn_include_queries
+
+        dim_inner = dim_head * heads
+        dim_context = default(dim_context, dim)
+
+        self.attend = Attend(causal = causal, dropout = dropout, use_flash = use_flash)
+        self.to_q = nn.Linear(dim, dim_inner, bias = False)
+        self.to_kv = nn.Linear(dim_context, dim_inner * 2, bias = False)
+        self.to_out = nn.Linear(dim_inner, dim, bias = False)
+
+    def forward(self, x, context = None, mask = None):
+        h, has_context = self.heads, exists(context)
+
+        context = default(context, x)
+
+        if has_context and self.cross_attn_include_queries:
+            context = torch.cat((x, context), dim = -2)
+
+        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+
+        out = self.attend(q, k, v, mask = mask)
+
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+
+class Transformer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        depth,
+        causal=False,
+        dim_head=64,
+        heads=8,
+        use_flash=False,  # Flash Attention can be implemented using libraries like `xformers`.
+        dropout=0.,
+        ff_mult=4,
+        final_norm=False
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+
+        # RMSNorm is a popular normalization introduced in the transformer community,
+        # implemented in `xformers` and other libraries.
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                RMSNorm(dim),  # Libraries like `einops` can help simplify tensor manipulations here.
+                Attention(
+                    dim,
+                    causal=causal,
+                    dim_head=dim_head,
+                    heads=heads,
+                    dropout=dropout,
+                    use_flash=use_flash
+                ),
+                RMSNorm(dim),
+                FeedForward(
+                    dim,
+                    mult=ff_mult
+                )
+            ]))
+
+        # Normalization layers like RMSNorm are essential for stable training of transformers.
+        self.norm = RMSNorm(dim) if final_norm else nn.Identity()
+
+    def forward(self, x, mask=None):
+        for attn_norm, attn, ff_norm, ff in self.layers:
+            x = attn(attn_norm(x), mask=mask) + x
+            x = ff(ff_norm(x)) + x
+
+        return self.norm(x)
+
 
 class SpeechPromptEncoder(nn.Module):
-
     @beartype
     def __init__(
         self,
@@ -300,6 +424,7 @@ class SpeechPromptEncoder(nn.Module):
         dropout = 0.2,
         kernel_size = 9,
         padding = 4,
+        ff_mult=4,
         use_flash_attn = True
 
     ):
@@ -324,6 +449,7 @@ class SpeechPromptEncoder(nn.Module):
             Rearrange('b c n -> b n c')
         )
 
+        # Model
         self.transformer = Transformer(
             dim = dims[-1],
             depth = depth,
@@ -333,417 +459,101 @@ class SpeechPromptEncoder(nn.Module):
             use_flash = use_flash_attn
         )
 
+
     def forward(self, x):
         assert x.shape[-1] == self.dim
-
         x = self.conv(x)
         x = self.transformer(x)
         return x
 
 # duration and pitch predictor seems to be the same
 
-class Block(nn.Module):
+class DurationPredictor(nn.Module):
     def __init__(
-        self,
-        dim,
-        dim_out,
-        kernel = 3,
-        groups = 8,
-        dropout = 0.
+        self, in_channels, out_channels, kernel_size, dropout=0.0, n_units=1
     ):
         super().__init__()
-        self.proj = nn.Conv1d(dim, dim_out, kernel, padding = kernel // 2)
-        self.norm = nn.GroupNorm(groups, dim_out)
-        self.act = nn.SiLU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.proj(x)
-        x = self.norm(x)
-        x = self.act(x)
-        x = self.dropout(x)
-        return x
-
-class ResnetBlock(nn.Module):
-    def __init__(
-        self,
-        dim,
-        dim_out,
-        kernel,
-        *,
-        dropout = 0.,
-        groups = 8,
-        num_convs = 2
-    ):
-        super().__init__()
-
-        blocks = []
-        for ind in range(num_convs):
-            is_first = ind == 0
-            dim_in = dim if is_first else dim_out
-            block = Block(
-                dim_in,
-                dim_out,
-                kernel,
-                groups = groups,
-                dropout = dropout
-            )
-            blocks.append(block)
-
-        self.blocks = nn.Sequential(*blocks)
-
-        self.res_conv = nn.Conv1d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-    def forward(self, x):
-        x = rearrange(x, 'b n c -> b c n')
-        h = self.blocks(x)
-        out = h + self.res_conv(x)
-        return rearrange(out, 'b c n -> b n c')
-
-def ConvBlock(dim, dim_out, kernel, dropout = 0.):
-    return nn.Sequential(
-        Rearrange('b n c -> b c n'),
-        nn.Conv1d(dim, dim_out, kernel, padding = kernel // 2),
-        nn.SiLU(),
-        nn.Dropout(dropout),
-        Rearrange('b c n -> b n c'),
-    )
-
-class DurationPitchPredictorTrunk(nn.Module):
-    def __init__(
-        self,
-        dim = 512,
-        depth = 10,
-        kernel_size = 3,
-        dim_context = None,
-        heads = 8,
-        dim_head = 64,
-        dropout = 0.2,
-        use_resnet_block = True,
-        num_convs_per_resnet_block = 2,
-        num_convolutions_per_block = 3,
-        use_flash_attn = False,
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([])
-
-        conv_klass = ConvBlock if not use_resnet_block else partial(ResnetBlock, num_convs = num_convs_per_resnet_block)
-
-        for _ in range(depth):
-            layer = nn.ModuleList([
-                nn.Sequential(*[
-                    conv_klass(dim, dim, kernel_size) for _ in range(num_convolutions_per_block)
-                ]),
-                RMSNorm(dim),
-                Attention(
-                    dim,
-                    dim_context = dim_context,
-                    heads = heads,
-                    dim_head = dim_head,
-                    dropout = dropout,
-                    use_flash = use_flash_attn,
-                    cross_attn_include_queries = True
-                )
-            ])
-
-            self.layers.append(layer)
-
-        self.to_pred = nn.Sequential(
-            nn.Linear(dim, 1),
-            Rearrange('... 1 -> ...'),
-            nn.ReLU()
+        self.conv1 = CNN.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            padding="same",
         )
+        self.conv2 = CNN.Conv1d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            padding="same",
+        )
+        self.linear = linear.Linear(n_neurons=n_units, input_size=out_channels)
+        self.ln1 = LayerNorm(out_channels)
+        self.ln2 = LayerNorm(out_channels)
+        self.relu = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.attention = nn.MultiheadAttention(embed_dim=out_channels, num_heads=8, batch_first=True)
+
+    def forward(self, x, x_mask, x_):
+        x = self.relu(self.conv1(x * x_mask))
+        x = self.ln1(x).to(x.dtype)
+        x = self.dropout1(x)
+
+        x = self.relu(self.conv2(x * x_mask))
+        x = self.ln2(x).to(x.dtype)
+        x = self.dropout2(x)
+
+        x_ = self.relu(self.conv1(x_))
+        x_ = self.ln1(x_).to(x.dtype)
+        x_ = self.dropout1(x_)
+
+        x_ = self.relu(self.conv2(x_))
+        x_ = self.ln2(x_)
+        x_ = self.dropout2(x_)
+        
+        attn_output, _ = self.attention(x, x_, x_) 
+        combined = x + attn_output
+
+        return self.linear(combined)
+
+
+class DurationPitchPred(nn.Module):
+    def __init__(
+        self,
+        enc_d_model=512,
+        dur_pred_kernel_size=3,
+        variance_predictor_dropout=0.5,
+    ):
+        super().__init__()
+        self.durPred = DurationPredictor(
+            in_channels=enc_d_model,
+            out_channels=enc_d_model,
+            kernel_size=dur_pred_kernel_size,
+            dropout=variance_predictor_dropout,
+        )
+        self.pitchPred = DurationPredictor(
+            in_channels=enc_d_model,
+            out_channels=enc_d_model,
+            kernel_size=dur_pred_kernel_size,
+            dropout=variance_predictor_dropout,
+        )
+        
+
     def forward(
         self,
-        x,
-        encoded_prompts,
-        prompt_mask = None,
+        phoneme_enc,
+        mask,
+        prompt_enc
     ):
-        for conv, norm, attn in self.layers:
-            x = conv(x)
-            x = attn(norm(x), encoded_prompts, mask = prompt_mask) + x
-
-        return self.to_pred(x)
-
-class DurationPitchPredictor(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        num_phoneme_tokens = None,
-        tokenizer: Optional[Tokenizer] = None,
-        dim_encoded_prompts = None,
-        num_convolutions_per_block = 3,
-        use_resnet_block = True,
-        num_convs_per_resnet_block = 2,
-        depth = 10,
-        kernel_size = 3,
-        heads = 8,
-        dim_head = 64,
-        dim_hidden = 512,
-        dropout = 0.2,
-        use_flash_attn = False
-    ):
-        super().__init__()
-        self.tokenizer = tokenizer
-        num_phoneme_tokens = default(num_phoneme_tokens, tokenizer.vocab_size if exists(tokenizer) else None)
-
-        dim_encoded_prompts = default(dim_encoded_prompts, dim)
-
-        self.phoneme_token_emb = nn.Embedding(num_phoneme_tokens, dim) if exists(num_phoneme_tokens) else nn.Identity()
-
-        self.to_pitch_pred = DurationPitchPredictorTrunk(
-            dim = dim_hidden,
-            depth = depth,
-            kernel_size = kernel_size,
-            dim_context = dim_encoded_prompts,
-            heads = heads,
-            dim_head = dim_head,
-            dropout = dropout,
-            use_resnet_block = use_resnet_block,
-            num_convs_per_resnet_block = num_convs_per_resnet_block,
-            num_convolutions_per_block = num_convolutions_per_block,
-            use_flash_attn = use_flash_attn,
-        )
-
-        self.to_duration_pred = copy.deepcopy(self.to_pitch_pred)
-
-    @beartype
-    def forward(
-        self,
-        x: Union[Tensor, List[str]],
-        encoded_prompts,
-        prompt_mask = None
-    ):
-        if is_bearable(x, List[str]):
-            assert exists(self.tokenizer)
-            x = self.tokenizer.texts_to_tensor_ids(x)
-
-        x = self.phoneme_token_emb(x)
-
-        duration_pred, pitch_pred = map(lambda fn: fn(x, encoded_prompts = encoded_prompts, prompt_mask = prompt_mask), (self.to_duration_pred, self.to_pitch_pred))
-
-
-        return duration_pred, pitch_pred
-
-# use perceiver resampler from flamingo paper - https://arxiv.org/abs/2204.14198
-# in lieu of "q-k-v" attention with the m queries becoming key / values on which ddpm network is conditioned on
-
-class PerceiverResampler(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        depth,
-        dim_context = None,
-        num_latents = 64, # m in the paper
-        dim_head = 64,
-        heads = 8,
-        ff_mult = 4,
-        use_flash_attn = False
-    ):
-        super().__init__()
-        dim_context = default(dim_context, dim)
-
-        self.proj_context = nn.Linear(dim_context, dim) if dim_context != dim else nn.Identity()
-
-        self.latents = nn.Parameter(torch.randn(num_latents, dim))
-        nn.init.normal_(self.latents, std = 0.02)
-
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                Attention(
-                    dim = dim,
-                    dim_head = dim_head,
-                    heads = heads,
-                    use_flash = use_flash_attn,
-                    cross_attn_include_queries = True
-                ),
-                FeedForward(dim = dim, mult = ff_mult)
-            ]))
-
-        self.norm = RMSNorm(dim)
-
-    def forward(self, x, mask = None):
-        batch = x.shape[0]
-
-        x = self.proj_context(x)
-
-        latents = repeat(self.latents, 'n d -> b n d', b = batch)
-
-        for attn, ff in self.layers:
-            latents = attn(latents, x, mask = mask) + latents
-            latents = ff(latents) + latents
-
-        return self.norm(latents)
-
-# model, which is wavenet + transformer
-
-class CausalConv1d(nn.Conv1d):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        kernel_size, = self.kernel_size
-        dilation, = self.dilation
-        stride, = self.stride
-
-        assert stride == 1
-        self.causal_padding = dilation * (kernel_size - 1)
-
-    def forward(self, x):
-        causal_padded_x = F.pad(x, (self.causal_padding, 0), value = 0.)
-        return super().forward(causal_padded_x)
-
-class WavenetResBlock(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        dilation,
-        kernel_size = 3,
-        skip_conv = False,
-        dim_cond_mult = None
-    ):
-        super().__init__()
-
-        self.cond = exists(dim_cond_mult)
-        self.to_time_cond = None
-
-        if self.cond:
-            self.to_time_cond = nn.Linear(dim * dim_cond_mult, dim * 2)
-
-        self.conv = CausalConv1d(dim, dim, kernel_size, dilation = dilation)
-        self.res_conv = CausalConv1d(dim, dim, 1)
-        self.skip_conv = CausalConv1d(dim, dim, 1) if skip_conv else None
-
-    def forward(self, x, t = None):
-
-        if self.cond:
-            assert exists(t)
-            t = self.to_time_cond(t)
-            t = rearrange(t, 'b c -> b c 1')
-            t_gamma, t_beta = t.chunk(2, dim = -2)
-
-        res = self.res_conv(x)
-
-        x = self.conv(x)
-
-        if self.cond:
-            x = x * t_gamma + t_beta
-
-        x = x.tanh() * x.sigmoid()
-
-        x = x + res
-
-        skip = None
-        if exists(self.skip_conv):
-            skip = self.skip_conv(x)
-
-        return x, skip
-
-
-class WavenetStack(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        layers,
-        kernel_size = 3,
-        has_skip = False,
-        dim_cond_mult = None
-    ):
-        super().__init__()
-        dilations = 2 ** torch.arange(layers)
-
-        self.has_skip = has_skip
-        self.blocks = mlist([])
-
-        for dilation in dilations.tolist():
-            block = WavenetResBlock(
-                dim = dim,
-                kernel_size = kernel_size,
-                dilation = dilation,
-                skip_conv = has_skip,
-                dim_cond_mult = dim_cond_mult
+        with autocast():
+            # duration predictor
+            predict_durations = self.durPred(phoneme_enc, mask, prompt_enc).squeeze(
+                -1
             )
+            predict_pitch = self.pitchPred(phoneme_enc, mask, prompt_enc)
 
-            self.blocks.append(block)
+        return predict_durations, predict_pitch
 
-    def forward(self, x, t):
-        residuals = []
-        skips = []
 
-        if isinstance(x, Tensor):
-            x = (x,) * len(self.blocks)
-
-        for block_input, block in zip(x, self.blocks):
-            residual, skip = block(block_input, t)
-
-            residuals.append(residual)
-            skips.append(skip)
-
-        if self.has_skip:
-            return torch.stack(skips)
-
-        return residuals
-
-class Wavenet(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        stacks,
-        layers,
-        init_conv_kernel = 3,
-        dim_cond_mult = None
-    ):
-        super().__init__()
-        self.init_conv = CausalConv1d(dim, dim, init_conv_kernel)
-        self.stacks = mlist([])
-
-        for ind in range(stacks):
-            is_last = ind == (stacks - 1)
-
-            stack = WavenetStack(
-                dim,
-                layers = layers,
-                dim_cond_mult = dim_cond_mult,
-                has_skip = is_last
-            )
-
-            self.stacks.append(stack)
-
-        self.final_conv = CausalConv1d(dim, dim, 1)
-
-    def forward(self, x, t = None):
-
-        x = self.init_conv(x)
-
-        for stack in self.stacks:
-            x = stack(x, t)
-
-        return self.final_conv(x.sum(dim = 0))
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, scale = True, dim_cond = None):
-        super().__init__()
-        self.cond = exists(dim_cond)
-        self.to_gamma_beta = nn.Linear(dim_cond, dim * 2) if self.cond else None
-
-        self.scale = dim ** 0.5
-        self.gamma = nn.Parameter(torch.ones(dim)) if scale else None
-
-    def forward(self, x, cond = None):
-        gamma = default(self.gamma, 1)
-        out = F.normalize(x, dim = -1) * self.scale * gamma
-
-        if not self.cond:
-            return out
-
-        assert exists(cond)
-        gamma, beta = self.to_gamma_beta(cond).chunk(2, dim = -1)
-        gamma, beta = map(lambda t: rearrange(t, 'b d -> b 1 d'), (gamma, beta))
-        return out * gamma + beta
 
 class ConditionableTransformer(nn.Module):
     def __init__(
@@ -808,8 +618,8 @@ class ConditionableTransformer(nn.Module):
 
         return self.to_pred(x)
 
-class Model(nn.Module):
 
+class Model(nn.Module):
     @beartype
     def __init__(
         self,
@@ -819,15 +629,16 @@ class Model(nn.Module):
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
+        num_media_embeds=4,
         wavenet_layers = 8,
         wavenet_stacks = 4,
         dim_cond_mult = 4,
-        use_flash_attn = True,
         dim_prompt = None,
         num_latents_m = 32,   # number of latents to be perceiver resampled ('q-k-v' with 'm' queries in the paper)
         resampler_depth = 2,
         cond_drop_prob = 0.,
-        condition_on_prompt= False
+        condition_on_prompt= False,
+        use_flash_attn=True
     ):
         super().__init__()
         self.dim = dim
@@ -837,8 +648,8 @@ class Model(nn.Module):
         dim_time = dim * dim_cond_mult
 
         self.to_time_cond = Sequential(
-            LearnedSinusoidalPosEmb(dim),
-            nn.Linear(dim + 1, dim_time),
+            PositionalEncoding(dim),
+            nn.Linear(dim, dim_time),
             nn.SiLU()
         )
 
@@ -862,14 +673,15 @@ class Model(nn.Module):
             )
 
             self.perceiver_resampler = PerceiverResampler(
-                dim = dim,
-                dim_context = dim_prompt,
-                num_latents = num_latents_m,
-                depth = resampler_depth,
-                dim_head = dim_head,
-                heads = heads,
-                use_flash_attn = use_flash_attn
+                dim=dim,
+                depth=resampler_depth,
+                num_latents=num_latents_m,
+                num_media_embeds=num_media_embeds,
+                dim_head=dim_head,
+                heads=heads
             )
+
+            self.proj_context = nn.Linear(dim_prompt, dim) if dim_prompt != dim else nn.Identity()
 
         # aligned conditioning from aligner + duration module
 
@@ -893,8 +705,6 @@ class Model(nn.Module):
             dim_cond_mult = dim_cond_mult
         )
 
-        # transformer
-
         self.transformer = ConditionableTransformer(
             dim = dim,
             depth = depth,
@@ -906,6 +716,7 @@ class Model(nn.Module):
             use_flash = use_flash_attn,
             cross_attn = condition_on_prompt
         )
+
 
     @property
     def device(self):
@@ -931,7 +742,6 @@ class Model(nn.Module):
         x,
         times,
         prompt = None,
-        prompt_mask = None,
         cond = None,
         cond_drop_prob = None
     ):
@@ -940,7 +750,8 @@ class Model(nn.Module):
 
         # prepare prompt condition
         # prob should remove going forward
-
+        if times.dim() == 1:
+            times = times.unsqueeze(-1)
         t = self.to_time_cond(times)
         c = None
 
@@ -957,9 +768,11 @@ class Model(nn.Module):
                 prompt_cond,
             )
 
-            t = torch.cat((t, prompt_cond), dim = -1)
+            t_repeated = t.squeeze(0).repeat(prompt_cond.shape[0], 1)  # Repeat along the batch dimension
+            t = torch.cat((t_repeated, prompt_cond), dim=-1)
 
-            resampled_prompt_tokens = self.perceiver_resampler(prompt, mask = prompt_mask)
+            prompt = self.proj_context(prompt)
+            resampled_prompt_tokens = self.perceiver_resampler(prompt).squeeze(1)
 
             c = torch.where(
                 rearrange(prompt_cond_drop_mask, 'b -> b 1 1'),
@@ -968,11 +781,9 @@ class Model(nn.Module):
             )
 
         # rearrange to channel first
-
         x = rearrange(x, 'b n d -> b d n')
-
+    
         # sum aligned condition to input sequence
-
         if exists(self.cond_to_model_dim):
             assert exists(cond)
             cond = self.cond_to_model_dim(cond)
@@ -985,136 +796,18 @@ class Model(nn.Module):
                 cond
             )
 
-            # for now, conform the condition to the length of the latent features
-
-            cond = pad_or_curtail_to_length(cond, x.shape[-1])
-
             x = x + cond
 
         # main wavenet body
 
         x = self.wavenet(x, t)
         x = rearrange(x, 'b d n -> b n d')
-
         x = self.transformer(x, t, context = c)
+
         return x
 
 # feedforward
 
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim = -1)
-        return F.gelu(gate) * x
-
-def FeedForward(dim, mult = 4, causal_conv = False):
-    dim_inner = int(dim * mult * 2 / 3)
-
-    conv = None
-    if causal_conv:
-        conv = nn.Sequential(
-            Rearrange('b n d -> b d n'),
-            CausalConv1d(dim_inner, dim_inner, 3),
-            Rearrange('b d n -> b n d'),
-        )
-
-    return Sequential(
-        nn.Linear(dim, dim_inner * 2),
-        GEGLU(),
-        conv,
-        nn.Linear(dim_inner, dim)
-    )
-
-# attention
-
-class Attention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        dim_context = None,
-        causal = False,
-        dim_head = 64,
-        heads = 8,
-        dropout = 0.,
-        use_flash = False,
-        cross_attn_include_queries = False
-    ):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        self.cross_attn_include_queries = cross_attn_include_queries
-
-        dim_inner = dim_head * heads
-        dim_context = default(dim_context, dim)
-
-        self.attend = Attend(causal = causal, dropout = dropout, use_flash = use_flash)
-        self.to_q = nn.Linear(dim, dim_inner, bias = False)
-        self.to_kv = nn.Linear(dim_context, dim_inner * 2, bias = False)
-        self.to_out = nn.Linear(dim_inner, dim, bias = False)
-
-    def forward(self, x, context = None, mask = None):
-        h, has_context = self.heads, exists(context)
-
-        context = default(context, x)
-
-        if has_context and self.cross_attn_include_queries:
-            context = torch.cat((x, context), dim = -2)
-
-        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
-
-        out = self.attend(q, k, v, mask = mask)
-
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
-
-# transformer encoder
-
-class Transformer(nn.Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        depth,
-        causal = False,
-        dim_head = 64,
-        heads = 8,
-        use_flash = False,
-        dropout = 0.,
-        ff_mult = 4,
-        final_norm = False
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([])
-
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                RMSNorm(dim),
-                Attention(
-                    dim,
-                    causal = causal,
-                    dim_head = dim_head,
-                    heads = heads,
-                    dropout = dropout,
-                    use_flash = use_flash
-                ),
-                RMSNorm(dim),
-                FeedForward(
-                    dim,
-                    mult = ff_mult
-                )
-            ]))
-
-        self.norm = RMSNorm(dim) if final_norm else nn.Identity()
-
-    def forward(self, x, mask = None):
-        for attn_norm, attn, ff_norm, ff in self.layers:
-            x = attn(attn_norm(x), mask = mask) + x
-            x = ff(ff_norm(x)) + x
-
-        return self.norm(x)
-
-# tensor helper functions
 
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
@@ -1165,8 +858,9 @@ class NaturalSpeech2(nn.Module):
         model: Model,
         codec: Optional[Union[SoundStream, EncodecWrapper]] = None,
         *,
-        
         tokenizer: Optional[Tokenizer] = None,
+        speaker_embedding_dim=192,
+        context_embedding_dim=768,
         target_sample_hz = None,
         timesteps = 1000,
         use_ddim = True,
@@ -1176,32 +870,25 @@ class NaturalSpeech2(nn.Module):
         time_difference = 0.,
         min_snr_loss_weight = True,
         min_snr_gamma = 5,
-        train_prob_self_cond = 0.9,
         rvq_cross_entropy_loss_weight = 0., # default this to off until we are sure it is working. not totally sold that this is critical
         dim_codebook: int = 128,
         duration_pitch_dim: int = 512,
-        aligner_dim_in: int = 80,
-        aligner_dim_hidden: int = 512,
-        aligner_attn_channels: int = 80,
-        num_phoneme_tokens: int = 150,
         pitch_emb_dim: int = 256,
         pitch_emb_pp_hidden_dim: int= 512,
-        calc_pitch_with_pyworld = True,     # pyworld or kaldi from torchaudio
         mel_hop_length = 160,
         audio_to_mel_kwargs: dict = dict(),
         scale = 1., # this will be set to < 1. for better convergence when training on higher resolution images
-        duration_loss_weight = 1.,
-        pitch_loss_weight = 1.,
-        aligner_loss_weight = 1.,
-        aligner_bin_loss_weight = 0.
+        duration_loss_weight = 0.1,
+        pitch_loss_weight = 0.0005
     ):
         super().__init__()
 
         self.conditional = model.condition_on_prompt
+        self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # model and codec
 
-        self.model = model
+        self.model = model.to(self._device)
         self.codec = codec
 
         assert exists(codec) or exists(target_sample_hz)
@@ -1221,23 +908,10 @@ class NaturalSpeech2(nn.Module):
 
             self.mel_hop_length = mel_hop_length
 
-            self.audio_to_mel = AudioToMel(
-                n_mels = aligner_dim_in,
-                hop_length = mel_hop_length,
-                **audio_to_mel_kwargs
-            )
-
-            self.calc_pitch_with_pyworld = calc_pitch_with_pyworld
-
-            self.phoneme_enc = PhonemeEncoder(tokenizer=tokenizer, num_tokens=num_phoneme_tokens)
+            self.phoneme_enc = PhonemeEncoder(tokenizer=tokenizer)
             self.prompt_enc = SpeechPromptEncoder(dim_codebook=dim_codebook)
-            self.duration_pitch = DurationPitchPredictor(dim=duration_pitch_dim)
-            self.aligner = Aligner(dim_in=aligner_dim_in, dim_hidden=aligner_dim_hidden, attn_channels=aligner_attn_channels)
+            self.duration_pitch = DurationPitchPred()
             self.pitch_emb = nn.Embedding(pitch_emb_dim, pitch_emb_pp_hidden_dim)
-
-            self.aligner_loss = ForwardSumLoss()
-            self.bin_loss = BinLoss()
-            self.aligner_bin_loss_weight = aligner_bin_loss_weight
 
         # rest of ddpm
 
@@ -1274,10 +948,6 @@ class NaturalSpeech2(nn.Module):
 
         self.time_difference = time_difference
 
-        # probability for self conditioning during training
-
-        self.train_prob_self_cond = train_prob_self_cond
-
         # min snr loss weight
 
         self.min_snr_loss_weight = min_snr_loss_weight
@@ -1291,7 +961,10 @@ class NaturalSpeech2(nn.Module):
 
         self.duration_loss_weight = duration_loss_weight
         self.pitch_loss_weight = pitch_loss_weight
-        self.aligner_loss_weight = aligner_loss_weight
+
+        # Speaker and Context Embeddings
+        self.speaker_encoder = nn.Linear(speaker_embedding_dim, duration_pitch_dim)
+        self.context_encoder = nn.Linear(context_embedding_dim, duration_pitch_dim)
 
     @property
     def device(self):
@@ -1446,486 +1119,429 @@ class NaturalSpeech2(nn.Module):
 
         return prompt
 
-    def expand_encodings(self, phoneme_enc, attn, pitch):
+
+    def expand_encodings(self, phoneme_enc, attn, pitch, speaker_emb, context_emb):
+        # Apply attention-based expansion
         expanded_dur = einsum('k l m n, k j m -> k j n', attn, phoneme_enc)
         pitch_emb = self.pitch_emb(rearrange(f0_to_coarse(pitch), 'b 1 t -> b t'))
         pitch_emb = rearrange(pitch_emb, 'b t d -> b d t')
+        target_dtype = pitch_emb.dtype  # Use pitch_emb's dtype as the target dtype
+
+        attn = attn.to(target_dtype) 
         expanded_pitch = einsum('k l m n, k j m -> k j n', attn, pitch_emb)
-        expanded_encodings = expanded_dur + expanded_pitch
-        return expanded_encodings
+
+        # Add the necessary dimension for broadcasting
+        speaker_emb = rearrange(speaker_emb, 'b 1 d -> b d 1')
+        context_emb = rearrange(context_emb, 'b 1 d -> b d 1')
+
+        # Combine expanded components
+        try:
+            expanded_combined = torch.cat((expanded_dur, expanded_pitch, speaker_emb, context_emb), dim=-1)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Shape mismatch during addition: expanded_dur={expanded_dur.shape}, "
+                f"expanded_pitch={expanded_pitch.shape}, context_emb={context_emb.shape}"
+                f"speaker_emb={speaker_emb.shape}"
+            ) from e
+
+        return expanded_combined
+
+
 
     @torch.no_grad()
     def sample(
         self,
         *,
         length,
-        prompt = None,
-        batch_size = 1,
-        cond_scale = 1.,
-        text = None,
-        text_lens = None,
+        prompt=None,
+        batch_size=1,
+        cond_scale=1.0,
+        phoneme=None,
+        speaker_embeddings=None,
+        context_embeddings=None
     ):
         sample_fn = self.ddpm_sample if not self.use_ddim else self.ddim_sample
 
         prompt_enc = cond = None
 
         if self.conditional:
-            assert exists(prompt) and exists(text)
+            assert exists(prompt) and exists(phoneme)
+            assert exists(speaker_embeddings) and exists(context_embeddings)
+
             prompt = self.process_prompt(prompt)
             prompt_enc = self.prompt_enc(prompt)
-            phoneme_enc = self.phoneme_enc(text)
+            phoneme_enc, mask = self.phoneme_enc(phoneme)
 
-            duration, pitch = self.duration_pitch(phoneme_enc, prompt_enc)
+            duration, pitch = self.duration_pitch(phoneme_enc, mask, prompt_enc)
+            
             pitch = rearrange(pitch, 'b n -> b 1 n')
 
             aln_mask = generate_mask_from_repeats(duration).float()
 
-            cond = self.expand_encodings(rearrange(phoneme_enc, 'b n d -> b d n'), rearrange(aln_mask, 'b n c -> b 1 n c'), pitch)
+            speaker_emb = self.speaker_encoder(speaker_embeddings)
+            context_emb = self.context_encoder(context_embeddings)
 
-        if exists(prompt):
-            batch_size = prompt.shape[0]
+            cond = self.expand_encodings(
+                rearrange(phoneme_enc, 'b n d -> b d n'),
+                rearrange(aln_mask, 'b n c -> b 1 n c'),
+                pitch,
+                speaker_emb=speaker_emb,
+                context_emb=context_emb
+
+            )
 
         audio = sample_fn(
             (batch_size, length, self.dim),
-            prompt = prompt_enc,
-            cond = cond,
-            cond_scale = cond_scale
+            prompt=prompt_enc,
+            cond=cond,
+            cond_scale=cond_scale
         )
 
         if exists(self.codec):
             audio = self.codec.decode(audio)
-
             if audio.ndim == 3:
                 audio = rearrange(audio, 'b 1 n -> b n')
 
         return audio
 
+
     def forward(
         self,
         audio,
-        text = None,
-        text_lens = None,
-        mel = None,
-        mel_lens = None,
-        codes = None,
-        prompt = None,
-        pitch = None,
+        phoneme=None,
+        segment=None,
+        prompt=None,
+        pitch=None,
+        speaker_embeddings=None,
+        context_embeddings=None,
+        return_loss=True,
         *args,
         **kwargs
     ):
         batch, is_raw_audio = audio.shape[0], audio.ndim == 2
+        with autocast():
+            # Process speaker and context embeddings
+            assert exists(speaker_embeddings), "Speaker embeddings must be provided."
+            assert exists(context_embeddings), "Context embeddings must be provided."
+            audio = audio.to(self._device)
 
-        # compute the prompt encoding and cond
+            if prompt is not None:
+                prompt = prompt.to(self._device)
 
-        prompt_enc = None
-        cond = None
-        duration_pitch_loss = 0.
+            context_embeddings = context_embeddings.unsqueeze(1).to(self._device)
+            speaker_emb = self.speaker_encoder(speaker_embeddings).to(self._device)
+            context_emb = self.context_encoder(context_embeddings).to(self._device)
 
-        if self.conditional:
-            batch = prompt.shape[0]
+            # Initialize losses
+            aux_loss = 0.0
+            duration_loss = 0.0
+            pitch_loss = 0.0
 
-            assert exists(text)
-            text_max_length = text.shape[-1]
+            # Conditional processing
+            if self.conditional:
+                assert exists(prompt), "Prompt must be provided for conditional processing."
+                assert exists(phoneme), "Text must be provided for conditional processing."
 
-            if not exists(text_lens):
-                text_lens = torch.full((batch,), text_max_length, device = self.device, dtype = torch.long)
+                # Process prompt
+                prompt = self.process_prompt(prompt)
+                prompt_enc = self.prompt_enc(prompt)
+                phoneme_enc, mask = self.phoneme_enc(phoneme)
 
-            text_lens.clamp_(max = text_max_length)
+                duration_pred, pitch_pred = self.duration_pitch(phoneme_enc, mask, prompt_enc)
 
-            text_mask = rearrange(create_mask(text_lens, text_max_length), 'b n -> b 1 n')
+                # Initialize tensors for pitch and alignment
+                pitch = torch.zeros_like(pitch_pred)
+                aln_hard = torch.zeros_like(duration_pred)
 
-            prompt = self.process_prompt(prompt)
-            prompt_enc = self.prompt_enc(prompt)
-            phoneme_enc = self.phoneme_enc(text)
+                # Iterate over each batch
+                for batch_idx, batch_segments in enumerate(segment):
+                    phoneme_ = phoneme[batch_idx].split()
 
-            # process pitch with kaldi
+                    # Iterate over batch segments and process them
+                    for segment_idx, segment_details in batch_segments.items():
+                        try:
+                            # Extract relevant details
+                            label = segment_details[0]
+                            duration = segment_details[1].get('duration_sec', 0)
+                            mean_pitch = segment_details[1].get('mean_pitch', 0)
+                            
+                            # Ensure segment index is within bounds and phonemes align
+                            segment_idx = int(segment_idx)  # Ensure segment_idx is an integer
+                            if segment_idx < len(phoneme_) and phoneme_[segment_idx] == label:
+                                aln_hard[batch_idx, segment_idx] = torch.tensor(duration, dtype=aln_hard.dtype)
+                                pitch[batch_idx, segment_idx] = mean_pitch
+                            else:
+                                # Handle cases where the phoneme doesn't match
+                                print(f"Phoneme mismatch at segment {segment_idx} in batch {batch_idx}: {label} vs {phoneme_[segment_idx]}")
+                        except Exception as e:
+                            print(f"Error processing segment {segment_idx} in batch {batch_idx}: {e}")
+                            continue
 
-            if not exists(pitch):
-                assert exists(audio) and audio.ndim == 2
-                assert exists(self.target_sample_hz)
+                aln_hard = aln_hard * 100
+                
+                aln_mask = generate_mask_from_repeats(aln_hard)
+                aln_mask = aln_mask.to(torch.float)
 
-                if self.calc_pitch_with_pyworld:
-                    pitch = compute_pitch_pyworld(
-                        audio,
-                        sample_rate = self.target_sample_hz,
-                        hop_length = self.mel_hop_length
-                    )
-                else:
-                    pitch = compute_pitch_pytorch(audio, self.target_sample_hz)
+                # Calculate losses
+                duration_loss = F.l1_loss(aln_hard, duration_pred)
 
-                pitch = rearrange(pitch, 'b n -> b 1 n')
+                pitch_loss = F.l1_loss(pitch, pitch_pred)
 
-            # process mel
+                # Combine auxiliary losses
+                overall_duration_loss = duration_loss * self.duration_loss_weight
+                overall_pitch_loss = (pitch_loss * self.pitch_loss_weight)
+                aux_loss = overall_duration_loss + overall_pitch_loss
 
-            if not exists(mel):
-                assert exists(audio) and audio.ndim == 2
-                mel = self.audio_to_mel(audio)
 
-                if exists(pitch):
-                    mel = mel[..., :pitch.shape[-1]]
+            # Handle raw audio encoding with codec
+            if is_raw_audio:
+                assert exists(self.codec), "Codec must be provided for raw audio input."
+                with torch.no_grad():
+                    self.codec.eval()
+                    audio, codes, _ = self.codec(audio, return_encoded=True)
 
-            mel_max_length = mel.shape[-1]
+            pitch = rearrange(pitch, 'b n 1 -> b 1 n')
+            # pitch_pred = rearrange(pitch_pred, 'b n 1 -> b 1 n')
 
-            if not exists(mel_lens):
-                mel_lens = torch.full((batch,), mel_max_length, device = self.device, dtype = torch.long)
+            cond =  self.expand_encodings(
+                rearrange(phoneme_enc, 'b n d -> b d n'),
+                rearrange(aln_mask, 'b n c -> b 1 n c'),
+                pitch,
+                speaker_emb=speaker_emb,
+                context_emb=context_emb,
+            )
 
-            mel_lens.clamp_(max = mel_max_length)
+            target_length = audio.shape[-2]
+            cond = F.interpolate(cond, size=target_length, mode='linear', align_corners=False)
 
-            mel_mask = rearrange(create_mask(mel_lens, mel_max_length), 'b n -> b 1 n')
+            # Shape and device checks
+            batch, n, d, device = *audio.shape, self.device
+            assert d == self.dim, f"Codec codebook dimension {d} must match model dimensions {self.dim}"
 
-            # alignment
+            # Diffusion step
+            times = torch.zeros((batch,), device=device).float().uniform_(0, 1.0)
+            noise = torch.randn_like(audio)
+            gamma = self.gamma_schedule(times)
+            padded_gamma = right_pad_dims_to(audio, gamma)
+            alpha, sigma = gamma_to_alpha_sigma(padded_gamma, self.scale)
+            noised_audio = alpha * audio + sigma * noise
 
-            aln_hard, aln_soft, aln_log, aln_mask = self.aligner(phoneme_enc, text_mask, mel, mel_mask)
-            duration_pred, pitch_pred = self.duration_pitch(phoneme_enc, prompt_enc)
+            # Predict and calculate diffusion loss
+            pred = self.model(noised_audio, times, prompt=prompt_enc, cond=cond)
 
-            pitch = average_over_durations(pitch, aln_hard)
+            if self.objective == "eps":
+                target = noise
+            elif self.objective == "x0":
+                target = audio
+            elif self.objective == "v":
+                target = alpha * noise - sigma * audio
 
-            cond = self.expand_encodings(rearrange(phoneme_enc, 'b n d -> b d n'), rearrange(aln_mask, 'b n c -> b 1 n c'), pitch)
+            loss = F.mse_loss(pred, target, reduction="none")
+            loss = reduce(loss, "b ... -> b", "mean")
 
-            # pitch and duration loss
+            # Min SNR loss weighting
+            snr = (alpha ** 2) / (sigma ** 2)
+            maybe_clipped_snr = snr.clone()
+            if self.min_snr_loss_weight:
+                maybe_clipped_snr.clamp_(max=self.min_snr_gamma)
 
-            duration_loss = F.l1_loss(aln_hard, duration_pred)
+            if self.objective == "eps":
+                loss_weight = maybe_clipped_snr / snr
+            elif self.objective == "x0":
+                loss_weight = maybe_clipped_snr
+            elif self.objective == "v":
+                loss_weight = maybe_clipped_snr / (snr + 1)
 
-            pitch = rearrange(pitch, 'b 1 d -> b d')
-            pitch_loss = F.l1_loss(pitch, pitch_pred)
+            loss = (loss * loss_weight).mean()
+        
+        loss = loss + aux_loss
 
-            align_loss = self.aligner_loss(aln_log, text_lens, mel_lens)
+        return {
+            "loss": loss,
+            "mse_loss": loss,
+            "aux_loss": aux_loss,
+            "duration_loss": overall_duration_loss,
+            "pitch_loss": overall_pitch_loss,
+        }
 
-            if self.aligner_bin_loss_weight > 0.:
-                align_bin_loss = self.bin_loss(aln_mask, aln_log, text_lens) * self.aligner_bin_loss_weight
-                align_loss = align_loss + align_bin_loss
-
-            # weigh the losses
-
-            aux_loss = (duration_loss * self.duration_loss_weight) \
-                    + (pitch_loss * self.pitch_loss_weight) \
-                    + (align_loss * self.aligner_loss_weight)
-
-        # automatically encode raw audio to residual vq with codec
-
-        assert not (is_raw_audio and not exists(self.codec)), 'codec must be passed in if one were to train on raw audio'
-
-        if is_raw_audio:
-            with torch.no_grad():
-                self.codec.eval()
-                audio, codes, _ = self.codec(audio, return_encoded = True)
-
-        # shapes and device
-
-        batch, n, d, device = *audio.shape, self.device
-
-        assert d == self.dim, f'codec codebook dimension {d} must match model dimensions {self.dim}'
-
-        # sample random times
-
-        times = torch.zeros((batch,), device = device).float().uniform_(0, 1.)
-
-        # noise sample
-
-        noise = torch.randn_like(audio)
-
-        gamma = self.gamma_schedule(times)
-        padded_gamma = right_pad_dims_to(audio, gamma)
-        alpha, sigma =  gamma_to_alpha_sigma(padded_gamma, self.scale)
-
-        noised_audio = alpha * audio + sigma * noise
-
-        # predict and take gradient step
-
-        pred = self.model(noised_audio, times, prompt = prompt_enc, cond = cond)
-
-        if self.objective == 'eps':
-            target = noise
-
-        elif self.objective == 'x0':
-            target = audio
-
-        elif self.objective == 'v':
-            target = alpha * noise - sigma * audio
-
-        loss = F.mse_loss(pred, target, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b', 'mean')
-
-        # min snr loss weight
-
-        snr = (alpha * alpha) / (sigma * sigma)
-        maybe_clipped_snr = snr.clone()
-
-        if self.min_snr_loss_weight:
-            maybe_clipped_snr.clamp_(max = self.min_snr_gamma)
-
-        if self.objective == 'eps':
-            loss_weight = maybe_clipped_snr / snr
-
-        elif self.objective == 'x0':
-            loss_weight = maybe_clipped_snr
-
-        elif self.objective == 'v':
-            loss_weight = maybe_clipped_snr / (snr + 1)
-
-        loss =  (loss * loss_weight).mean()
-
-        # cross entropy loss to codebooks
-
-        if self.rvq_cross_entropy_loss_weight == 0 or not exists(codes):
-            return loss
-
-        if self.objective == 'x0':
-            x_start = pred
-
-        elif self.objective == 'eps':
-            x_start = safe_div(audio - sigma * pred, alpha)
-
-        elif self.objective == 'v':
-            x_start = alpha * audio - sigma * pred
-
-        _, ce_loss = self.codec.rq(x_start, codes)
-
-        return loss + (self.rvq_cross_entropy_loss_weight * ce_loss) + duration_pitch_loss
 
 # trainer
-
 def cycle(dl):
+    assert dl is not None, "DataLoader is None. Ensure it is properly initialized."
     while True:
         for data in dl:
             yield data
 
-class Trainer(object):
-    def __init__(
-        self,
-        diffusion_model: NaturalSpeech2,
-        *,
-        dataset: Optional[Dataset] = None,
-        folder = None,
-        train_batch_size = 16,
-        gradient_accumulate_every = 1,
-        train_lr = 1e-4,
-        train_num_steps = 100000,
-        ema_update_every = 10,
-        ema_decay = 0.995,
-        adam_betas = (0.9, 0.99),
-        save_and_sample_every = 1000,
-        num_samples = 1,
-        results_folder = './results',
-        amp = False,
-        mixed_precision_type = 'fp16',
-        use_ema = True,
-        split_batches = True,
-        dataloader = None,
-        data_max_length = None,
-        data_max_length_seconds = 2,
-        sample_length = None
-    ):
-        super().__init__()
 
-        # accelerator
+class CustomDataset(Dataset):
+    def __init__(self, dataset_folder, max_items=None, sampling_rate=24000):
+            self.dataset_folder = dataset_folder
+            self.sampling_rate = sampling_rate
+            # Collect files
+            self.audio_files = sorted(
+                [path for path in (Path(dataset_folder) / 'wav').rglob('*.wav') if not path.name.startswith('._')]
+            )
+            # self.text_files = sorted(
+            #     [path for path in (Path(dataset_folder) / 'txt').rglob('*.txt') if not path.name.startswith('._')]
+            # )
+            self.phoneme_files = sorted(
+                [path for path in (Path(dataset_folder) / 'phonemized').rglob('*.txt') if not path.name.startswith('._')]
+            )
+            self.speaker_embeddings_files = sorted(
+                [path for path in (Path(dataset_folder) / 'speaker_embeddings').rglob('*.npy') if not path.name.startswith('._')]
+            )
+            self.context_embeddings_files = sorted(
+                [path for path in (Path(dataset_folder) / 'context_embeddings').rglob('*.npy') if not path.name.startswith('._')]
+            )
+            self.segment_files = sorted(
+                [path for path in (Path(dataset_folder) / 'segments').rglob('*.json') if not path.name.startswith('._')]
+            )
 
-        self.accelerator = Accelerator(
-            split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
-        )
+            # Get the base file names (without extensions) for matching
+            audio_basenames = {path.stem for path in self.audio_files}
+            # text_basenames = {path.stem for path in self.text_files}
+            phoneme_basenames = {path.stem for path in self.phoneme_files}
+            context_basenames = {path.stem for path in self.context_embeddings_files}
+            segment_basenames = {path.stem for path in self.segment_files}
 
-        # model
+            # Intersection of all file sets (excluding speaker embeddings)
+            common_basenames = audio_basenames & phoneme_basenames & context_basenames & segment_basenames
 
-        self.model = diffusion_model
-        assert exists(diffusion_model.codec)
+            # Filter files to only include common base names
+            self.audio_files = [path for path in self.audio_files if path.stem in common_basenames]
+            # self.text_files = [path for path in self.text_files if path.stem in common_basenames]
+            self.phoneme_files = [path for path in self.phoneme_files if path.stem in common_basenames]
+            self.context_embeddings_files = [
+                path for path in self.context_embeddings_files if path.stem in common_basenames
+            ]
+            self.segment_files = [path for path in self.segment_files if path.stem in common_basenames]
 
-        self.dim = diffusion_model.dim
+            # Apply the limit if max_items is specified
+            if max_items is not None:
+                self.audio_files = self.audio_files[:max_items]
+                # self.text_files = self.text_files[:max_items]
+                self.phoneme_files = self.phoneme_files[:max_items]
+                self.context_embeddings_files = self.context_embeddings_files[:max_items]
+                self.segment_files = self.segment_files[:max_items]
 
-        # training hyperparameters
+            logger.info(f"Dataset initialized with {len(self.audio_files)} audio files, "
+                        f"{len(self.phoneme_files)} phoneme files, "
+                        f"{len(self.context_embeddings_files)} context embeddings, "
+                        f"{len(self.segment_files)} segments, "
+                        f"{len(self.speaker_embeddings_files)} speaker embeddings.")
 
-        self.batch_size = train_batch_size
-        self.gradient_accumulate_every = gradient_accumulate_every
-        self.train_num_steps = train_num_steps
+    def __len__(self):
+        return len(self.audio_files)
 
-        # dataset and dataloader
+    def __getitem__(self, idx):
+        try:
+            audio_path = self.audio_files[idx]
+            phoneme_path = self.phoneme_files[idx]
+            context_embedding_path = self.context_embeddings_files[idx]
+            segment_path = self.segment_files[idx]
+            speaker_id = context_embedding_path.parts[-2]
+            
+            # Locate the speaker embedding and prompt audio
+            speaker_embedding_path = next(
+                (path for path in self.speaker_embeddings_files if path.stem == speaker_id),
+                None  # Default to None if no match found
+            )
+            speaker_folder = Path(self.dataset_folder) / 'wav' / speaker_id
 
-        dl = dataloader
+            # Load data
+            audio, original_sample_rate = torchaudio.load(str(audio_path))
 
-        if not exists(dl):
-            assert exists(dataset) or exists(folder)
+            if original_sample_rate != self.sampling_rate:
+                audio = torchaudio.transforms.Resample(original_sample_rate, self.sampling_rate)(audio)
+                
+            with open(phoneme_path, 'r') as f:
+                phoneme = f.read()
+            try:
+                speaker_embedding = torch.tensor(np.load(speaker_embedding_path), dtype=torch.float16)
+            except:
+                speaker_embedding = torch.tensor(np.zeros(shape=(192, 1), dtype=torch.float16))
 
-            if exists(dataset):
-                self.ds = dataset
-            elif exists(folder):
-                # create dataset
+            try:
+                context_embedding = torch.tensor(np.load(context_embedding_path), dtype=torch.float16)
+            except:
+                context_embedding = torch.tensor(np.zeros(shape=(768), dtype=torch.float16))
+            
+            with open(segment_path, 'r') as file:
+                segment = json.load(file)
 
-                if exists(data_max_length_seconds):
-                    assert not exists(data_max_length)
-                    data_max_length = int(data_max_length_seconds * diffusion_model.target_sample_hz)
+            # Load and validate the prompt
+            prompt_audio = self.accumulate_prompt_audio(speaker_folder)
+
+            return {
+                'audio': audio,
+                'phoneme': phoneme,
+                'speaker_embeddings': speaker_embedding,
+                'context_embeddings': context_embedding,
+                'prompt': prompt_audio,
+                'segment': segment
+            }
+        except IndexError as e:
+            logger.error(f"IndexError: {e} - Index {idx} is out of range.")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error at index {idx}: {e}")
+            raise
+
+    def _is_valid_prompt(self, path):
+        """
+        Validate if a prompt audio file meets the desired criteria for inclusion in accumulation.
+        """
+        try:
+            metadata = torchaudio.info(str(path))
+            duration = metadata.num_frames / metadata.sample_rate
+            return duration > 0  # Include all audio files with a positive duration
+        except Exception as e:
+            logger.warning(f"Error checking prompt validity for {path}: {e}")
+            return False
+
+    def accumulate_prompt_audio(self, speaker_folder):
+        """
+        Accumulate audio for a speaker up to 30 seconds and pad if necessary.
+        """
+        max_duration = 30  # Maximum duration in seconds
+        accumulated_audio = []
+        total_frames = 0
+        sampling_rate = self.sampling_rate
+
+        for audio_path in speaker_folder.rglob('*.wav'):
+            if not self._is_valid_prompt(audio_path):
+                continue
+
+            try:
+                audio, sr = torchaudio.load(str(audio_path))
+                if sr != sampling_rate:
+                    audio = torchaudio.transforms.Resample(sr, sampling_rate)(audio)
+
+                frames = audio.shape[1]
+                if total_frames + frames > max_duration * sampling_rate:
+                    # Truncate audio to fit the remaining time
+                    remaining_frames = max_duration * sampling_rate - total_frames
+                    accumulated_audio.append(audio[:, :remaining_frames])
+                    total_frames += remaining_frames
+                    break
                 else:
-                    assert exists(data_max_length)
+                    accumulated_audio.append(audio)
+                    total_frames += frames
 
-                self.ds = SoundDataset(
-                    folder,
-                    max_length = data_max_length,
-                    target_sample_hz = diffusion_model.target_sample_hz,
-                    seq_len_multiple_of = diffusion_model.seq_len_multiple_of
-                )
+            except Exception as e:
+                logger.warning(f"Error loading prompt audio {audio_path}: {e}")
+                continue
 
-                dl = DataLoader(
-                    self.ds,
-                    batch_size = train_batch_size,
-                    shuffle = True,
-                    pin_memory = True,
-                    num_workers = cpu_count()
-                )
+        # Combine all accumulated audio
+        if accumulated_audio:
+            accumulated_audio = torch.cat(accumulated_audio, dim=1)
+        else:
+            # No valid audio, return silence
+            accumulated_audio = torch.zeros(1, 0)
 
-        dl = self.accelerator.prepare(dl)
-        self.dl = cycle(dl)
+        # Pad to 30 seconds if necessary
+        if accumulated_audio.shape[1] < max_duration * sampling_rate:
+            padding = max_duration * sampling_rate - accumulated_audio.shape[1]
+            accumulated_audio = torch.nn.functional.pad(accumulated_audio, (0, padding), mode='constant', value=0)
 
-        # optimizer
-
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
-
-        # for logging results in a folder periodically
-
-        self.use_ema = use_ema
-        self.ema = None
-
-        if self.accelerator.is_main_process and use_ema:
-            # make sure codec is not part of the EMA
-            # encodec seems to be not deepcopyable, so this is a necessary hack
-
-            codec = diffusion_model.codec
-            diffusion_model.codec = None
-
-            self.ema = EMA(
-                diffusion_model,
-                beta = ema_decay,
-                update_every = ema_update_every,
-                ignore_startswith_names = set(['codec.'])
-            ).to(self.device)
-
-            diffusion_model.codec = codec
-            self.ema.ema_model.codec = codec
-
-        # sampling hyperparameters
-
-        self.sample_length = default(sample_length, data_max_length)
-        self.num_samples = num_samples
-        self.save_and_sample_every = save_and_sample_every
-
-        # results folder
-
-        self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok = True)
-
-        # step counter state
-
-        self.step = 0
-
-        # prepare model, dataloader, optimizer with accelerator
-
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
-
-    def print(self, msg):
-        return self.accelerator.print(msg)
-
-    @property
-    def unwrapped_model(self):
-        return self.accelerator.unwrap_model(self.model)
-    
-    @property
-    def device(self):
-        return self.accelerator.device
-
-    def save(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
-
-        data = {
-            'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
-            'opt': self.opt.state_dict(),
-            'ema': self.ema.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
-            'version': __version__
-        }
-
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
-
-    def load(self, milestone):
-        accelerator = self.accelerator
-        device = accelerator.device
-
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
-
-        model = self.accelerator.unwrap_model(self.model)
-        model.load_state_dict(data['model'])
-
-        self.step = data['step']
-        self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
-            self.ema.load_state_dict(data["ema"])
-
-        if 'version' in data:
-            print(f"loading from version {data['version']}")
-
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
-            self.accelerator.scaler.load_state_dict(data['scaler'])
-
-    def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
-
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-
-            while self.step < self.train_num_steps:
-
-                total_loss = 0.
-
-                for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-
-                    with self.accelerator.autocast():
-                        loss = self.model(data)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
-
-                    self.accelerator.backward(loss)
-
-                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
-                pbar.set_description(f'loss: {total_loss:.4f}')
-
-                accelerator.wait_for_everyone()
-
-                self.opt.step()
-                self.opt.zero_grad()
-
-                accelerator.wait_for_everyone()
-
-                self.step += 1
-
-                if accelerator.is_main_process:
-                    self.ema.update()
-
-                    if divisible_by(self.step, self.save_and_sample_every):
-                        milestone = self.step // self.save_and_sample_every
-
-                        models = [(self.unwrapped_model, str(self.step))]
-
-                        if self.use_ema:
-                            models.append((self.ema.ema_model, f'{self.step}.ema'))
-
-                        for model, label in models:
-                            model.eval()
-
-                            with torch.no_grad():
-                                generated = model.sample(
-                                    batch_size = self.num_samples,
-                                    length = self.sample_length
-                                )
-
-                            for ind, t in enumerate(generated):
-                                filename = str(self.results_folder / f'sample_{label}.flac')
-                                t = rearrange(t, 'n -> 1 n')
-                                torchaudio.save(filename, t.cpu().detach(), self.unwrapped_model.target_sample_hz)
-
-                        self.print(f'{self.step}: saving to {str(self.results_folder)}')
-
-                        self.save(milestone)
-
-                pbar.update(1)
-
-        self.print('training complete')
+        return accumulated_audio

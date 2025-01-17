@@ -8,14 +8,7 @@ from naturalspeech2_pytorch.utils.cleaner import TextProcessor
 from naturalspeech2_pytorch.utils.phonemizers.espeak_wrapper import ESpeak
 
 # default phoneme set
-
-_vowels = "iyɨʉɯuɪʏʊeøɘəɵɤoɛœɜɞʌɔæɐaɶɑɒᵻ"
-_non_pulmonic_consonants = "ʘɓǀɗǃʄǂɠǁʛ"
-_pulmonic_consonants = "pbtdʈɖcɟkɡqɢʔɴŋɲɳnɱmʙrʀⱱɾɽɸβfvθðszʃʒʂʐçʝxɣχʁħʕhɦɬɮʋɹɻjɰlɭʎʟ"
-_suprasegmentals = "'̃ˈˌːˑ. ,-"
-_other_symbols = "ʍwɥʜʢʡɕʑɺɧʲ"
-_diacrilics = "ɚ˞ɫ"
-_phonemes = _vowels + _non_pulmonic_consonants + _pulmonic_consonants + _suprasegmentals + _other_symbols + _diacrilics
+char_to_id = {'': 0, '[PAD]': 70, '[UNK]': 68, 'aɪ': 2, 'aɪə': 3, 'aɪɚ': 4, 'aʊ': 5, 'b': 6, 'd': 7, 'dt': 8, 'dʒ': 9, 'eɪ': 10, 'f': 11, 'h': 12, 'h#': 13, 'i': 14, 'iə': 15, 'iː': 16, 'j': 17, 'k': 18, 'l': 19, 'm': 20, 'n': 21, 'n̩': 22, 'oʊ': 23, 'p': 24, 'r': 25, 's': 26, 't': 27, 'tʃ': 28, 'uː': 29, 'v': 30, 'w': 31, 'x': 32, 'z': 33, '|': 1, 'æ': 34, 'ç': 35, 'ð': 36, 'ŋ': 37, 'ɐ': 38, 'ɑː': 39, 'ɑːɹ': 40, 'ɑ̃': 41, 'ɔ': 42, 'ɔɪ': 43, 'ɔː': 44, 'ɔːɹ': 45, 'ɔ̃': 46, 'ə': 47, 'əl': 48, 'ɚ': 49, 'ɛ': 50, 'ɛɹ': 51, 'ɜː': 52, 'ɡ': 53, 'ɡʲ': 54, 'ɪ': 55, 'ɪɹ': 56, 'ɬ': 57, 'ɹ': 58, 'ɾ': 59, 'ʃ': 60, 'ʊ': 61, 'ʊɹ': 62, 'ʌ': 63, 'ʒ': 64, 'ʔ': 65, 'θ': 66, 'ᵻ': 67}
 
 # default map
 
@@ -38,7 +31,7 @@ def default(val, d):
 class Tokenizer:
     def __init__(
         self,
-        vocab = _phonemes,
+        char_to_id = char_to_id,
         text_cleaner: Optional[Callable] = None,
         phonemizer: Optional[Callable] = None,
         default_lang = "en-us",
@@ -51,17 +44,18 @@ class Tokenizer:
         self.use_eos_bos = use_eos_bos
         self.pad_id = pad_id
 
-        self.vocab = vocab
-        self.vocab_size = len(vocab)
+        self.vocab = list(char_to_id.keys())
+        self.vocab_size = len(char_to_id)
 
-        self.char_to_id = {char: idx for idx, char in enumerate(self.vocab)}
-        self.id_to_char = {idx: char for idx, char in enumerate(self.vocab)}
+        self.char_to_id = char_to_id
+        self.id_to_char = {v: k for k, v in char_to_id.items()}
 
         self.phonemizer = phonemizer
         if not exists(self.phonemizer):
             self.phonemizer = ESpeak(language = default_lang)
 
-        self.language = self.phonemizer.language
+        # self.language = self.phonemizer.language
+        self.language = default_lang
         self.not_found_characters = []
 
     @property
@@ -76,11 +70,13 @@ class Tokenizer:
                 idx = self.char_to_id[char]
                 token_ids.append(idx)
             except KeyError:
-                # discard but store not found characters
-                if char not in self.not_found_characters:
-                    self.not_found_characters.append(char)
-                    print(text)
-                    print(f" [!] Character {repr(char)} not found in the vocabulary. Discarding it.")
+                idx = self.char_to_id['[UNK]']
+                token_ids.append(idx)
+                # # discard but store not found characters
+                # if char not in self.not_found_characters:
+                #     self.not_found_characters.append(char)
+                #     print(text)
+                #     print(f" [!] Character {repr(char)} not found in the vocabulary. Discarding it.")
         return token_ids
 
     def decode(self, token_ids: List[int]) -> str:
@@ -113,20 +109,28 @@ class Tokenizer:
         4. Add BOS and EOS characters
         5. Text to token IDs
         """
+        try:
+            language = default(language, self.espeak_language)
 
-        language = default(language, self.espeak_language)
+            cleaned_text = None
+            if self.text_cleaner is not None:
+                # text = self.text_cleaner(text, language=language)
+                text = self.text_cleaner(text)
+                cleaned_text = text
+            # phonemized = self.phonemizer.phonemize(text, separator="", language=language)
+            print(text)
+            phonemized = self.phonemizer.phonemize(text, separator=" h# ").split()
+            print(phonemized)
+            if self.add_blank:
+                phonemized = self.intersperse_blank_char(phonemized, True)
+            if self.use_eos_bos:
+                phonemized = self.pad_with_bos_eos(phonemized)
 
-        cleaned_text = None
-        if self.text_cleaner is not None:
-            text = self.text_cleaner(text, language=language)
-            cleaned_text = text
-        phonemized = self.phonemizer.phonemize(text, separator="", language=language)
-        if self.add_blank:
-            phonemized = self.intersperse_blank_char(phonemized, True)
-        if self.use_eos_bos:
-            phonemized = self.pad_with_bos_eos(phonemized)
-
-        return self.encode(phonemized), cleaned_text, phonemized
+            return self.encode(phonemized), cleaned_text, phonemized
+        except Exception as e:
+            print(f"Error processing text: {text}")
+            print(f"Exception: {e}")
+            raise
 
     def texts_to_tensor_ids(self, texts: List[str], language: str = None) -> Tensor:
         all_ids = []
@@ -136,6 +140,28 @@ class Tokenizer:
             all_ids.append(torch.tensor(ids))
 
         return pad_sequence(all_ids, batch_first = True, padding_value = self.pad_id)
+
+
+
+    def phoneme_to_tensor_ids(self, texts: List[str], padding_value: int) -> Tensor:
+        all_ids = []
+
+        for text in texts:
+            ids = self.encode(text)
+            all_ids.append(torch.tensor(ids))
+
+        return pad_sequence(all_ids, batch_first = True, padding_value = padding_value)
+
+
+    def texts_to_tensor_ids_with_phonemes(self, texts: List[str], language: str = None) -> Tensor:
+        all_ids = []
+        all_phonemes = []
+        for text in texts:
+            ids, _, phonemized  = self.text_to_ids(text, language = language)
+            all_ids.append(torch.tensor(ids))
+            all_phonemes.append(phonemized)
+
+        return pad_sequence(all_ids, batch_first = True, padding_value = self.pad_id), all_phonemes
 
     def ids_to_text(self, id_sequence: List[int]) -> str:
         """Converts a sequence of token IDs to a string of text."""
@@ -155,11 +181,11 @@ class Tokenizer:
         result[1::2] = char_sequence
         return result
 
-if __name__ == "__main__":
-    txt_cleaner = TextProcessor()
-    tokenizer = Tokenizer(vocab = _phonemes, text_cleaner = txt_cleaner.phoneme_cleaners, phonemizer = ESpeak(language="en-us"))
-    print(tokenizer.text_to_ids("Hello, Mr. Example, this is 9:30 am and  my number is 30.", language="en"))
-    tokenizer = Tokenizer(vocab = _phonemes, text_cleaner = txt_cleaner.phoneme_cleaners, phonemizer = ESpeak(language="fr-fr"))
-    print(tokenizer.text_to_ids("Hola, Sr. Ejemplo, son las 9:30 am y mi número es el 30.", language="es"))
-    tokenizer = Tokenizer(vocab = _phonemes, text_cleaner = txt_cleaner.phoneme_cleaners, phonemizer = ESpeak(language="hi"))
-    print(tokenizer.text_to_ids("हैलो, मिस्टर उदाहरण, यह सुबह 9:30 बजे है और मेरा नंबर 30 है।", language="hi"))
+# if __name__ == "__main__":
+#     txt_cleaner = TextProcessor()
+#     tokenizer = Tokenizer(vocab = _phonemes, text_cleaner = txt_cleaner.phoneme_cleaners, phonemizer = ESpeak(language="en-us"))
+#     print(tokenizer.text_to_ids("Hello, Mr. Example, this is 9:30 am and  my number is 30.", language="en"))
+#     tokenizer = Tokenizer(vocab = _phonemes, text_cleaner = txt_cleaner.phoneme_cleaners, phonemizer = ESpeak(language="fr-fr"))
+#     print(tokenizer.text_to_ids("Hola, Sr. Ejemplo, son las 9:30 am y mi número es el 30.", language="es"))
+#     tokenizer = Tokenizer(vocab = _phonemes, text_cleaner = txt_cleaner.phoneme_cleaners, phonemizer = ESpeak(language="hi"))
+#     print(tokenizer.text_to_ids("हैलो, मिस्टर उदाहरण, यह सुबह 9:30 बजे है और मेरा नंबर 30 है।", language="hi"))
